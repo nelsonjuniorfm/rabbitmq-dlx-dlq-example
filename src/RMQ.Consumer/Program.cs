@@ -8,6 +8,10 @@ const string exchangeName = "pedido.exchange";
 const string queueName = "pedido.criados";
 const string routingKey = "pedido.criado";
 
+const string dlxExchangeName = "pedido.dlx";
+const string dlxQueueName = "pedido.dlq";
+const string dlxRoutingKey = "pedido.nao.entregue";
+
 var factory = new ConnectionFactory()
 {
     HostName = "localhost",
@@ -21,6 +25,29 @@ var factory = new ConnectionFactory()
 await using var connection = await factory.CreateConnectionAsync();
 await using var chanel = await connection.CreateChannelAsync();
 
+//dlx
+await chanel.ExchangeDeclareAsync(
+    exchange: dlxExchangeName,
+    type: ExchangeType.Direct,
+    durable: true,
+    autoDelete: false
+);
+
+//dlq
+await chanel.QueueDeclareAsync(
+    queue: dlxQueueName,
+    durable: true,
+    exclusive: false,
+    autoDelete: false
+);
+
+//dlq queue bind
+await chanel.QueueBindAsync(
+    queue: dlxQueueName,
+    exchange: dlxExchangeName,
+    routingKey: dlxRoutingKey
+);
+
 await chanel.ExchangeDeclareAsync(
     exchange: exchangeName,
     type: ExchangeType.Direct,
@@ -28,11 +55,19 @@ await chanel.ExchangeDeclareAsync(
     autoDelete: false
 );
 
+
+var argsDlq = new Dictionary<string, object?>
+{
+    { "x-dead-letter-exchange", dlxExchangeName },
+    { "x-dead-letter-routing-key", dlxRoutingKey }
+};
+
 await chanel.QueueDeclareAsync(
     queue: queueName,
     durable: true,
     exclusive: false,
-    autoDelete: false
+    autoDelete: false,
+    arguments: argsDlq
 );
 
 await chanel.QueueBindAsync(
@@ -59,12 +94,48 @@ consumer.ReceivedAsync += async (model, ea) =>
         var json = Encoding.UTF8.GetString(body);
         var pedido = JsonSerializer.Deserialize<Pedido>(json);
 
+        Console.WriteLine("");
+        Console.WriteLine("-------------------------------------------------------------");
+        Console.WriteLine("---------------- NOVA MENSAGEM RECEBIDA ---------------------");
         Console.WriteLine("-------------------------------------------------------------");
         Console.WriteLine($"[Consumer] Pedido recebido:......: {pedido?.Id}");
         Console.WriteLine($"Cliente..........................: {pedido?.ClienteEmail}");
         Console.WriteLine($"Valor............................: {pedido?.ValorTotal:C}");
         Console.WriteLine($"Criando em.......................: {pedido?.DataCriacao:O}");
         Console.WriteLine("-------------------------------------------------------------");
+        Console.WriteLine("");
+
+        if (pedido is null)
+        {
+            throw new Exception("Pedido está nulo");
+        }
+
+        if(pedido.ValorTotal < 0)
+        {
+            Console.WriteLine($"[Consumer] Pedido com valor inválido: {pedido.ValorTotal}");
+            Console.WriteLine($"[Consumer] Enviando para DLX: {dlxExchangeName} com routing key: {dlxRoutingKey}");
+            
+            await chanel.BasicNackAsync(
+                deliveryTag: ea.DeliveryTag, 
+                multiple: false, 
+                requeue: false); // - Faz ir para DLQ
+            
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(pedido.ClienteEmail))
+        {
+            Console.WriteLine($"[Consumer] Pedido com email inválido: {pedido.ClienteEmail}");
+            Console.WriteLine($"[Consumer] Enviando para DLX: {dlxExchangeName} com routing key: {dlxRoutingKey}");
+            
+            await chanel.BasicNackAsync(
+                deliveryTag: ea.DeliveryTag, 
+                multiple: false, 
+                requeue: false);
+            
+            return;
+        }
+
 
         await Task.Delay(2000);
 
@@ -91,5 +162,6 @@ await chanel.BasicConsumeAsync(
         consumer: consumer
     );
 
-Console.WriteLine("Consumer iniciado. Precione ENTER para sair");
+Console.WriteLine("Consumer iniciado. Aguardando mensagens... Precione ENTER para sair");
+Console.WriteLine("");
 Console.ReadLine();
